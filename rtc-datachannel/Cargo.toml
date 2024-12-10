@@ -13,9 +13,9 @@ repository = "https://github.com/webrtc-rs/ortc/tree/master/rtc-datachannel"
 shared = { version = "0.2.0", path = "../rtc-shared", package = "rtc-shared", default-features = false, features = ["marshal"] }
 sctp = { version = "0.2.0", path = "../rtc-sctp", package = "rtc-sctp" }
 
-bytes = "1.5.0"
-log = "0.4.21"
+bytes = "1.9.0"
+log = "0.4.22"
 
 [dev-dependencies]
-env_logger = "0.11.3"
-chrono = "0.4.35"
+env_logger = "0.11.5"
+chrono = "0.4.39"

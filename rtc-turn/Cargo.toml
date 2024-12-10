@@ -13,14 +13,14 @@ repository = "https://github.com/webrtc-rs/ortc/tree/master/rtc-turn"
 shared = { version = "0.2.0", path = "../rtc-shared", package = "rtc-shared", default-features = false, features = [] }
 stun = { version = "0.2.0", path = "../rtc-stun", package = "rtc-stun" }
 
-bytes = "1.5.0"
-log = "0.4.21"
+bytes = "1.9.0"
+log = "0.4.22"
 
 [dev-dependencies]
-env_logger = "0.11.3"
-chrono = "0.4.35"
+env_logger = "0.11.5"
+chrono = "0.4.39"
 hex = "0.4.3"
-clap = { version = "4.5.3", features = ["derive"] }
+clap = { version = "4.5.23", features = ["derive"] }
 criterion = "0.5.1"
 crossbeam-channel = "0.5"
 ctrlc = "3.4"

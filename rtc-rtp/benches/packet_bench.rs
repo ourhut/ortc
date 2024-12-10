@@ -3,7 +3,9 @@
 
 use bytes::{Bytes, BytesMut};
 use criterion::{criterion_group, criterion_main, Criterion};
-use rtp::{header::*, packet::*};
+use rtc_rtp::{
+    header::Extension, header::Header, header::EXTENSION_PROFILE_TWO_BYTE, packet::Packet,
+};
 use shared::marshal::{Marshal, MarshalSize, Unmarshal};
 
 fn benchmark_packet(c: &mut Criterion) {
