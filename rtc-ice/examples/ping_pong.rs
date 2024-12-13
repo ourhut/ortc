@@ -5,38 +5,396 @@ use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Empty};
 use hyper::Uri;
 use hyper::{body::Incoming as Body, Method, Request, Response, StatusCode};
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use lazy_static::lazy_static;
+use hyper_util::rt::TokioIo;
 use rtc_ice::agent::agent_config::AgentConfig;
 use rtc_ice::agent::Agent;
+use rtc_ice::candidate::candidate_host::CandidateHostConfig;
+use rtc_ice::candidate::{Candidate, CandidateConfig};
 use rtc_ice::state::ConnectionState;
 use rtc_ice::{Credentials, Event};
 use shared::{Protocol, Transmit, TransportContext};
-use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use stun::message::Message;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{mpsc, Mutex};
-use tokio::time::sleep;
+use tokio::signal;
+use tokio::sync::{broadcast, mpsc};
+use tokio::time::{self};
 
-type SenderType = Arc<Mutex<mpsc::Sender<String>>>;
-type ReceiverType = Arc<Mutex<mpsc::Receiver<String>>>;
-
-lazy_static! {
-    static ref REMOTE_AUTH_CHANNEL: (SenderType, ReceiverType) = create_channel(3);
-    static ref REMOTE_CAND_CHANNEL: (SenderType, ReceiverType) = create_channel(10);
+pub enum IceCommand {
+    RemoteCredentials { ufrag: String, pwd: String },
+    RemoteCandidate(String),
+    UdpPacket { data: BytesMut, addr: SocketAddr },
 }
 
-fn create_channel(capacity: usize) -> (SenderType, ReceiverType) {
-    let (tx, rx) = mpsc::channel::<String>(capacity);
-    (Arc::new(Mutex::new(tx)), Arc::new(Mutex::new(rx)))
+pub struct IceManager {
+    agent: Agent,
+    socket: UdpSocket,
+    command_rx: mpsc::Receiver<IceCommand>,
+    controlling: bool,
+}
+
+impl IceManager {
+    pub fn new(
+        agent: Agent,
+        socket: UdpSocket,
+        command_rx: mpsc::Receiver<IceCommand>,
+        controlling: bool,
+    ) -> Self {
+        Self {
+            agent,
+            socket,
+            command_rx,
+            controlling,
+        }
+    }
+
+    fn create_local_candidate(&mut self) -> Result<Candidate> {
+        let local_addr = self
+            .socket
+            .local_addr()
+            .context("Failed to get local socket address")?;
+
+        let candidate = CandidateHostConfig {
+            base_config: CandidateConfig {
+                network: "udp".to_owned(),
+                address: local_addr.ip().to_string(),
+                port: local_addr.port(),
+                component: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .new_candidate_host()
+        .context("Failed to create host candidate")?;
+
+        self.agent.add_local_candidate(candidate.clone())?;
+
+        Ok(candidate)
+    }
+
+    pub fn get_local_credentials(&self) -> &Credentials {
+        self.agent.get_local_credentials()
+    }
+
+    pub async fn spawn(
+        mut self,
+        mut shutdown: broadcast::Receiver<()>,
+    ) -> Result<tokio::task::JoinHandle<Result<()>>> {
+        Ok(tokio::spawn(async move {
+            let result = self.run(&mut shutdown).await;
+            println!("IceManager shutdown complete");
+            result
+        }))
+    }
+
+    async fn run(&mut self, shutdown: &mut broadcast::Receiver<()>) -> Result<()> {
+        let mut tick_interval = time::interval(Duration::from_millis(100));
+        let mut buf = vec![0u8; 2048];
+
+        loop {
+            tokio::select! {
+                _ = shutdown.recv() => {
+                    println!("IceManager received shutdown signal");
+                    break;
+                }
+
+                Some(command) = self.command_rx.recv() => {
+                    self.handle_command(command).await?;
+                }
+
+                _ = tick_interval.tick() => {
+                    self.handle_tick().await?;
+                }
+
+                recv_result = self.socket.recv_from(&mut buf) => {
+                    match recv_result {
+                        Ok((size, addr)) if size > 0 => {
+                            self.handle_udp_packet(&buf[..size], addr).await?;
+                        }
+                        Ok(_) => (),
+                        Err(e) => println!("UDP receive error: {}", e),
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_command(&mut self, command: IceCommand) -> Result<()> {
+        match command {
+            IceCommand::RemoteCredentials { ufrag, pwd } => {
+                println!("Received remote credentials: ufrag={}, pwd={}", ufrag, pwd);
+                self.agent
+                    .start_connectivity_checks(self.controlling, ufrag, pwd)
+                    .context("Failed to start connectivity checks")?;
+            }
+
+            IceCommand::RemoteCandidate(cand_str) => {
+                match rtc_ice::candidate::unmarshal_candidate(&cand_str) {
+                    Ok(candidate) => {
+                        println!("Adding remote candidate: {}", cand_str);
+                        self.agent
+                            .add_remote_candidate(candidate)
+                            .context("Failed to add remote candidate")?;
+                    }
+                    Err(e) => println!("Failed to parse remote candidate: {}", e),
+                }
+            }
+
+            IceCommand::UdpPacket { data, addr } => {
+                self.agent
+                    .handle_read(Transmit {
+                        now: Instant::now(),
+                        transport: TransportContext {
+                            local_addr: self.socket.local_addr()?,
+                            peer_addr: addr,
+                            ecn: None,
+                            protocol: Protocol::UDP,
+                        },
+                        message: data,
+                    })
+                    .context("Failed to handle UDP packet")?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_tick(&mut self) -> Result<()> {
+        // Handle outgoing transmissions
+        while let Some(transmit) = self.agent.poll_transmit() {
+            self.socket
+                .send_to(&transmit.message[..], transmit.transport.peer_addr)
+                .await
+                .context("Failed to send ICE transmission")?;
+        }
+
+        // Handle ICE timeouts
+        if let Some(timeout) = self.agent.poll_timeout() {
+            if Instant::now() >= timeout {
+                self.agent.handle_timeout(Instant::now());
+            }
+        }
+
+        // Process ICE events
+        while let Some(event) = self.agent.poll_event() {
+            match event {
+                Event::ConnectionStateChange(state) => {
+                    println!("ICE Connection State Changed: {}", state);
+                    match state {
+                        ConnectionState::Completed => {
+                            if let Some((local, remote)) = self.agent.get_selected_candidate_pair()
+                            {
+                                println!("Selected local candidate: {:?}", local.addr());
+                                println!("Selected remote candidate: {:?}", remote.addr());
+                            }
+                        }
+                        ConnectionState::Failed => {
+                            println!("ICE negotiation failed");
+                            return Err(anyhow::anyhow!("ICE negotiation failed"));
+                        }
+                        ConnectionState::Closed => {
+                            println!("ICE agent closed");
+                            return Ok(());
+                        }
+                        _ => {
+                            println!("ICE agent state changed: {:?}", state);
+                        }
+                    }
+                }
+                Event::SelectedCandidatePairChange(local, remote) => {
+                    println!("Selected candidate pair changed:");
+                    println!("Local: {:?}", local.addr());
+                    println!("Remote: {:?}", remote.addr());
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_udp_packet(&mut self, data: &[u8], addr: SocketAddr) -> Result<()> {
+        if stun::message::is_message(data) {
+            let mut message = Message::new();
+            message
+                .unmarshal_binary(data)
+                .context("Failed to unmarshal STUN message")?;
+            println!("Received STUN message from {}", message);
+            self.agent
+                .handle_read(Transmit {
+                    now: Instant::now(),
+                    transport: TransportContext {
+                        local_addr: self.socket.local_addr()?,
+                        peer_addr: addr,
+                        ecn: None,
+                        protocol: Protocol::UDP,
+                    },
+                    message: BytesMut::from(data),
+                })
+                .context("Failed to handle STUN message")?;
+        } else {
+            println!(
+                "Received non-STUN message from {}: {}",
+                addr,
+                String::from_utf8_lossy(data)
+            );
+        }
+        Ok(())
+    }
+}
+
+pub struct HttpServer {
+    listener: TcpListener,
+    ice_tx: mpsc::Sender<IceCommand>,
+}
+
+impl HttpServer {
+    pub async fn new(addr: SocketAddr, ice_tx: mpsc::Sender<IceCommand>) -> Result<Self> {
+        let listener = TcpListener::bind(addr)
+            .await
+            .context("Failed to bind HTTP server")?;
+
+        println!("HTTP server listening on {}", addr);
+
+        Ok(Self { listener, ice_tx })
+    }
+
+    pub async fn spawn(
+        self,
+        mut shutdown: broadcast::Receiver<()>,
+    ) -> Result<tokio::task::JoinHandle<Result<()>>> {
+        Ok(tokio::spawn(async move {
+            let result = self.run(&mut shutdown).await;
+            println!("HTTP server shutdown complete");
+            result
+        }))
+    }
+
+    async fn run(&self, shutdown: &mut broadcast::Receiver<()>) -> Result<()> {
+        loop {
+            tokio::select! {
+                _ = shutdown.recv() => {
+                    println!("HTTP server received shutdown signal");
+                    break;
+                }
+
+                accept_result = self.listener.accept() => {
+                    match accept_result {
+                        Ok((stream, _)) => {
+                            let ice_tx = self.ice_tx.clone();
+                            tokio::spawn(async move {
+                                let service = hyper::service::service_fn(move |req| {
+                                    let ice_tx = ice_tx.clone();
+                                    async move {
+                                        handle_request(req, ice_tx).await
+                                    }
+                                });
+
+                                if let Err(e) = hyper::server::conn::http1::Builder::new()
+                                    .serve_connection(TokioIo::new(stream), service)
+                                    .await
+                                {
+                                    println!("Error serving connection: {}", e);
+                                }
+                            });
+                        }
+                        Err(e) => println!("Error accepting connection: {}", e),
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+type ResponseType = Response<BoxBody<Bytes, std::convert::Infallible>>;
+
+async fn handle_request(
+    req: Request<Body>,
+    ice_tx: mpsc::Sender<IceCommand>,
+) -> Result<ResponseType, anyhow::Error> {
+    match (req.method(), req.uri().path()) {
+        (&Method::POST, "/remoteAuth") => handle_remote_auth(req, ice_tx).await,
+        (&Method::POST, "/remoteCandidate") => handle_remote_candidate(req, ice_tx).await,
+        (&Method::GET, "/health") => Ok(Response::builder()
+            .status(StatusCode::OK)
+            .body(Empty::new().boxed())
+            .context("Failed to build health check response")?),
+        _ => Ok(Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Empty::new().boxed())
+            .context("Failed to build 404 response")?),
+    }
+}
+
+async fn handle_remote_auth(
+    req: Request<Body>,
+    ice_tx: mpsc::Sender<IceCommand>,
+) -> Result<ResponseType, anyhow::Error> {
+    let body_bytes = req
+        .into_body()
+        .collect()
+        .await
+        .context("Failed to read request body")?
+        .to_bytes();
+
+    let message =
+        String::from_utf8(body_bytes.to_vec()).context("Failed to parse body as UTF-8")?;
+
+    let parts: Vec<_> = message.split(':').collect();
+    if parts.len() != 2 {
+        return Ok(Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Empty::new().boxed())
+            .context("Failed to build bad request response")?);
+    }
+
+    ice_tx
+        .send(IceCommand::RemoteCredentials {
+            ufrag: parts[0].to_string(),
+            pwd: parts[1].to_string(),
+        })
+        .await
+        .context("Failed to send credentials to ICE manager")?;
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .body(Empty::new().boxed())
+        .context("Failed to build success response")?)
+}
+
+async fn handle_remote_candidate(
+    req: Request<Body>,
+    ice_tx: mpsc::Sender<IceCommand>,
+) -> Result<ResponseType, anyhow::Error> {
+    let body_bytes = req
+        .into_body()
+        .collect()
+        .await
+        .context("Failed to read request body")?
+        .to_bytes();
+
+    let candidate =
+        String::from_utf8(body_bytes.to_vec()).context("Failed to parse body as UTF-8")?;
+
+    ice_tx
+        .send(IceCommand::RemoteCandidate(candidate))
+        .await
+        .context("Failed to send candidate to ICE manager")?;
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .body(Empty::new().boxed())
+        .context("Failed to build success response")?)
 }
 
 #[derive(Parser)]
 #[command(name = "ICE Ping Pong")]
-struct Cli {
+pub struct Cli {
     #[arg(short, long)]
     controlling: bool,
 
@@ -47,441 +405,218 @@ struct Cli {
     log_level: String,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let cli = Cli::parse();
-    initialize_logging(&cli)?;
-
-    let (local_http_port, remote_http_port) = determine_ports(cli.controlling);
-    let udp_socket = initialize_udp_socket(cli.controlling).await?;
-    let local_addr = udp_socket
-        .local_addr()
-        .context("Failed to get local address")?;
-    println!("UDP socket bound to {}", local_addr);
-
-    let mut ice_agent = initialize_ice_agent()?;
-    start_http_server(local_http_port).await;
-
-    wait_for_remote_ready(remote_http_port)
-        .await
-        .context("Failed to wait for remote server readiness")?;
-
-    handle_ice_negotiation(&mut ice_agent, remote_http_port, cli.controlling).await?;
-    monitor_agent_events(&mut ice_agent, &udp_socket).await?;
-
-    Ok(())
-}
-
-fn initialize_logging(cli: &Cli) -> Result<()> {
-    if cli.debug {
-        let log_level =
-            log::LevelFilter::from_str(&cli.log_level).unwrap_or(log::LevelFilter::Info);
-        env_logger::Builder::new().filter(None, log_level).init();
-    }
-    Ok(())
-}
-
-fn determine_ports(controlling: bool) -> (u16, u16) {
-    if controlling {
-        (9000, 9001)
-    } else {
-        (9001, 9000)
-    }
-}
-
-async fn initialize_udp_socket(controlling: bool) -> Result<UdpSocket> {
-    let port = if controlling { 4000 } else { 4001 };
-    println!("Binding UDP socket on port {}", port);
-    UdpSocket::bind(("0.0.0.0", port))
-        .await
-        .context("Failed to bind UDP socket")
-}
-
-fn initialize_ice_agent() -> Result<Agent> {
-    Agent::new(Arc::new(AgentConfig {
-        disconnected_timeout: Some(Duration::from_secs(5)),
-        failed_timeout: Some(Duration::from_secs(5)),
-        ..Default::default()
-    }))
-    .context("Failed to initialize ICE agent")
-}
-
-async fn start_http_server(local_http_port: u16) {
-    tokio::spawn(async move {
-        let addr: SocketAddr = ([0, 0, 0, 0], local_http_port).into();
-        let listener = match TcpListener::bind(addr).await {
-            Ok(listener) => listener,
-            Err(e) => {
-                eprintln!("Failed to bind HTTP server listener: {}", e);
-                return;
-            }
-        };
-
-        loop {
-            let (stream, _) = match listener.accept().await {
-                Ok(conn) => conn,
-                Err(e) => {
-                    eprintln!("Failed to accept connection: {}", e);
-                    continue;
-                }
-            };
-
-            tokio::spawn(async move {
-                let service = hyper::service::service_fn(remote_handler);
-                if let Err(e) = hyper::server::conn::http1::Builder::new()
-                    .serve_connection(TokioIo::new(stream), service)
-                    .await
-                {
-                    eprintln!("Error serving connection: {}", e);
-                }
-            });
-        }
-    });
-}
-
-async fn remote_handler(
-    req: Request<Body>,
-) -> Result<Response<BoxBody<Bytes, Infallible>>, anyhow::Error> {
-    match (req.method(), req.uri().path()) {
-        (&Method::POST, "/remoteAuth") => handle_remote_auth(req).await,
-        (&Method::POST, "/remoteCandidate") => handle_remote_candidate(req).await,
-        (&Method::GET, "/health") => handle_health_check().await,
-        _ => {
-            eprintln!("404 Not Found: {} {}", req.method(), req.uri().path());
-            Ok(Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(Empty::new().boxed())
-                .context("Failed to build response for 404 Not Found")?)
-        }
-    }
-}
-async fn handle_remote_auth(
-    req: Request<hyper::body::Incoming>,
-) -> Result<Response<BoxBody<Bytes, Infallible>>, anyhow::Error> {
-    // Attempt to collect the body and convert it to a string
-    let body_bytes = match req.into_body().collect().await {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            eprintln!("Failed to collect request body: {}", e);
-            return Ok(Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(Empty::new().boxed())
-                .context("Failed to build response for body collection error")?);
-        }
-    };
-
-    let message = match String::from_utf8(body_bytes.to_bytes().into()) {
-        Ok(message) => message,
-        Err(e) => {
-            eprintln!("Failed to convert body to string: {}", e);
-            return Ok(Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(Empty::new().boxed())
-                .context("Failed to build response for string conversion error")?);
-        }
-    };
-
-    // Attempt to send the message to the queue
-    let tx = REMOTE_AUTH_CHANNEL.0.lock().await;
-    match tx.send(message).await {
-        Ok(_) => Ok(Response::builder()
-            .status(StatusCode::OK)
-            .body(Empty::new().boxed())
-            .context("Failed to build success response")?),
-        Err(e) => {
-            eprintln!("Failed to send auth to peer: {}", e);
-            Ok(Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Empty::new().boxed())
-                .context("Failed to build response for queue error")?)
-        }
-    }
-}
-
-async fn handle_remote_candidate(
-    req: Request<Body>,
-) -> Result<Response<BoxBody<Bytes, Infallible>>, anyhow::Error> {
-    // Attempt to collect the body and convert it to a string
-    let body_bytes = match req.into_body().collect().await {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            eprintln!("Failed to collect request body: {}", e);
-            return Ok(Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(Empty::new().boxed())
-                .context("Failed to build response for body collection error")?);
-        }
-    };
-
-    let message = match String::from_utf8(body_bytes.to_bytes().into()) {
-        Ok(message) => message,
-        Err(e) => {
-            eprintln!("Failed to convert body to string: {}", e);
-            return Ok(Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(Empty::new().boxed())
-                .context("Failed to build response for string conversion error")?);
-        }
-    };
-
-    // Attempt to send the message to the queue
-    let tx = REMOTE_CAND_CHANNEL.0.lock().await;
-    match tx.send(message).await {
-        Ok(_) => Ok(Response::builder()
-            .status(StatusCode::OK)
-            .body(Empty::new().boxed())
-            .context("Failed to build success response")?),
-        Err(e) => {
-            eprintln!("Failed to send candidate to peer: {}", e);
-            Ok(Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Empty::new().boxed())
-                .context("Failed to build response for queue error")?)
-        }
-    }
-}
-
-/// Handles the health check route.
-async fn handle_health_check() -> Result<Response<BoxBody<Bytes, Infallible>>, anyhow::Error> {
-    Response::builder()
-        .status(StatusCode::OK)
-        .body(Empty::new().boxed())
-        .context("Failed to build health check response")
-}
-
-async fn handle_ice_negotiation(
-    ice_agent: &mut Agent,
-    remote_http_port: u16,
+pub struct App {
+    ice_manager: IceManager,
+    http_server: HttpServer,
+    shutdown_tx: broadcast::Sender<()>,
     controlling: bool,
-) -> Result<()> {
-    // Retrieve local ICE credentials
-    let Credentials { ufrag, pwd } = ice_agent.get_local_credentials();
-    println!("Local ICE Credentials: ufrag={}, pwd={}", ufrag, pwd);
-
-    // Send local credentials to remote peer
-    send_local_credentials(remote_http_port, &ufrag, &pwd).await?;
-
-    // Receive remote credentials from peer
-    let (remote_ufrag, remote_pwd) = receive_remote_credentials().await?;
-    println!(
-        "Received remote credentials: ufrag={}, pwd={}",
-        remote_ufrag, remote_pwd
-    );
-
-    // Start ICE connectivity checks
-    start_connectivity_checks(ice_agent, controlling, &remote_ufrag, &remote_pwd)?;
-
-    Ok(())
 }
 
-async fn send_local_credentials(remote_http_port: u16, ufrag: &str, pwd: &str) -> Result<()> {
-    let client = hyper_util::client::legacy::Client::builder(TokioExecutor::new()).build_http();
-    let uri = format!("http://localhost:{}/remoteAuth", remote_http_port);
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri(uri)
-        .body(format!("{}:{}", ufrag, pwd))
-        .context("Failed to build request for sending local credentials")?;
+impl App {
+    pub async fn new(cli: &Cli) -> Result<Self> {
+        // Initialize channels
+        let (ice_tx, ice_rx) = mpsc::channel::<IceCommand>(32);
+        let (shutdown_tx, _) = broadcast::channel(1);
 
-    client
-        .request(req)
-        .await
-        .context("Failed to send local credentials to remote peer")?;
+        // Initialize UDP socket
+        let socket = initialize_udp_socket(cli.controlling).await?;
+        println!("UDP socket bound to {}", socket.local_addr()?);
 
-    println!("Local credentials sent to remote peer");
-    Ok(())
-}
+        // Initialize ICE agent
+        let agent = initialize_ice_agent()?;
 
-fn start_connectivity_checks(
-    ice_agent: &mut Agent,
-    controlling: bool,
-    remote_ufrag: &str,
-    remote_pwd: &str,
-) -> Result<()> {
-    ice_agent
-        .start_connectivity_checks(
+        // Initialize components
+        let ice_manager = IceManager::new(agent, socket, ice_rx, cli.controlling);
+
+        let http_server = HttpServer::new(determine_http_addr(cli.controlling)?, ice_tx).await?;
+
+        Ok(Self {
+            ice_manager,
+            http_server,
+            shutdown_tx,
+            controlling: cli.controlling,
+        })
+    }
+
+    pub async fn run(self) -> Result<()> {
+        let App {
+            mut ice_manager,
+            http_server,
+            shutdown_tx,
             controlling,
-            remote_ufrag.to_string(),
-            remote_pwd.to_string(),
-        )
-        .context("Failed to start ICE connectivity checks")?;
+        } = self;
+        // First spawn the HTTP server so others can connect
+        let http_handle = http_server.spawn(shutdown_tx.subscribe()).await?;
 
-    println!("ICE connectivity checks started");
-    Ok(())
-}
+        // Then wait for the remote peer's HTTP server
+        // Use controlling directly since we moved it out
+        let remote_port = if self.controlling { 9001 } else { 9000 };
+        let uri = format!("http://127.0.0.1:{}/health", remote_port);
 
-async fn receive_remote_credentials() -> Result<(String, String)> {
-    let mut rx = REMOTE_AUTH_CHANNEL.1.lock().await;
-    if let Some(message) = rx.recv().await {
-        let parts: Vec<_> = message.split(':').collect();
-        if parts.len() == 2 {
-            return Ok((parts[0].to_string(), parts[1].to_string()));
-        }
-    }
-    Err(anyhow::anyhow!("Failed to receive remote credentials"))
-}
-
-async fn monitor_agent_events(
-    ice_agent: &mut Agent,
-    udp_socket: &UdpSocket,
-) -> Result<(), anyhow::Error> {
-    let mut buf = vec![0u8; 2048];
-
-    loop {
-        // Process outgoing transmissions from the ICE agent
-        process_transmissions(ice_agent, udp_socket).await?;
-
-        // Process ICE agent events
-        if process_ice_events(ice_agent).await? {
-            println!("Connection failed, exiting loop.");
-            break;
-        }
-
-        // Handle ICE timeouts
-        handle_ice_timeouts(ice_agent).await;
-
-        // Process incoming UDP packets
-        if let Ok((size, addr)) = udp_socket.recv_from(&mut buf).await {
-            if size > 0 {
-                process_incoming_packet(ice_agent, udp_socket, &buf[..size], addr).await?;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Processes outgoing transmissions from the ICE agent.
-async fn process_transmissions(
-    ice_agent: &mut Agent,
-    udp_socket: &UdpSocket,
-) -> Result<(), anyhow::Error> {
-    while let Some(transmit) = ice_agent.poll_transmit() {
-        println!(
-            "Sending {} bytes to {}",
-            transmit.message.len(),
-            transmit.transport.peer_addr
-        );
-        udp_socket
-            .send_to(&transmit.message[..], transmit.transport.peer_addr)
-            .await
-            .context("Failed to send ICE transmission")?;
-    }
-    Ok(())
-}
-
-/// Processes ICE agent events and handles state changes.
-async fn process_ice_events(ice_agent: &mut Agent) -> Result<bool, anyhow::Error> {
-    let mut is_failed = false;
-
-    while let Some(event) = ice_agent.poll_event() {
-        match event {
-            Event::ConnectionStateChange(cs) => {
-                println!("ConnectionStateChange: {}", cs);
-                if cs == ConnectionState::Failed {
-                    is_failed = true;
+        // Try to connect to remote
+        for attempt in 1..=10 {
+            match attempt_health_check(&uri).await {
+                Ok(()) => {
+                    println!("Remote server is ready");
+                    break;
+                }
+                Err(e) => {
+                    println!("Attempt {}/10 failed: {}", attempt, e);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                 }
             }
-            _ => {
-                println!(
-                    "Unhandled ICE agent event of type: {}",
-                    std::any::type_name::<Event>()
-                );
+        }
+        let credentials = ice_manager.get_local_credentials().clone();
+        let local_candidate = ice_manager.create_local_candidate()?;
+
+        // Then spawn the ICE manager, which will set up local candidates
+        let mut ice_handle = ice_manager.spawn(shutdown_tx.subscribe()).await?;
+
+        // Send our credentials to remote peer
+        send_credentials_to_remote(&credentials, controlling).await?;
+        send_candidate_to_remote(&local_candidate, controlling).await?;
+
+        let mut ice_done = false;
+
+        // Wait for shutdown signal
+        tokio::select! {
+            // If the ICE manager finishes first, handle its result
+            ice_result = &mut ice_handle => {
+                ice_done = true;
+
+                match ice_result {
+                    Ok(Ok(())) => println!("ICE Manager completed successfully"),
+                    Ok(Err(e)) => {
+                        println!("ICE Manager encountered an error: {}", e);
+                    },
+                    Err(join_error) => {
+                        println!("ICE Manager task panicked: {}", join_error);
+                    }
+                }
+                // In any case, we can signal shutdown since ICE manager is done
+                let _ = shutdown_tx.send(());
+            }
+
+            // If CTRL+C is pressed first, we trigger a graceful shutdown
+            _ = signal::ctrl_c() => {
+                println!("Received CTRL+C, initiating graceful shutdown...");
+                let _ = shutdown_tx.send(());
             }
         }
-    }
 
-    Ok(is_failed)
-}
-
-/// Handles ICE agent timeouts.
-async fn handle_ice_timeouts(ice_agent: &mut Agent) {
-    if let Some(timeout) = ice_agent.poll_timeout() {
-        let duration = timeout.duration_since(Instant::now());
-        tokio::time::sleep(duration).await;
-        ice_agent.handle_timeout(Instant::now());
-    }
-}
-
-/// Processes incoming UDP packets, checking for STUN messages or other data.
-async fn process_incoming_packet(
-    ice_agent: &mut Agent,
-    udp_socket: &UdpSocket,
-    buf: &[u8],
-    addr: std::net::SocketAddr,
-) -> Result<(), anyhow::Error> {
-    if stun::message::is_message(buf) {
-        println!("Received STUN message from {}", addr);
-        ice_agent.handle_read(Transmit::<BytesMut> {
-            now: Instant::now(),
-            transport: TransportContext {
-                local_addr: udp_socket.local_addr()?,
-                peer_addr: addr,
-                ecn: None,
-                protocol: Protocol::UDP,
-            },
-            message: BytesMut::from(buf),
-        })?;
-    } else {
-        println!(
-            "Received non-STUN message from {}: {}",
-            addr,
-            String::from_utf8_lossy(buf)
-        );
-    }
-    Ok(())
-}
-
-/// Waits for the remote server to become available before proceeding.
-async fn wait_for_remote_ready(remote_http_port: u16) -> Result<()> {
-    let host = "127.0.0.1";
-    let addr = format!("{}:{}", host, remote_http_port);
-    let uri: Uri = format!("http://{}/health", addr)
-        .parse()
-        .context("Failed to parse health check URI")?;
-
-    for attempt in 1..=10 {
-        match attempt_connection(&addr, &uri).await {
-            Ok(()) => {
-                println!("Remote server is ready after {} attempts.", attempt);
-                return Ok(());
-            }
-            Err(e) => {
-                println!(
-                    "Attempt {}/10 failed: {}. Retrying in 1 second...",
-                    attempt, e
-                );
-                sleep(Duration::from_secs(1)).await;
+        if !ice_done {
+            // If ICE wasn't done yet, now we can await ice_handle.
+            match ice_handle.await {
+                Ok(Ok(())) => println!("ICE Manager completed successfully"),
+                Ok(Err(e)) => println!("ICE Manager encountered an error: {}", e),
+                Err(join_error) => println!("ICE Manager panicked: {}", join_error),
             }
         }
-    }
+        // Wait for https server to shut down
+        // Now await the HTTP server
+        match http_handle.await {
+            Ok(Ok(())) => println!("HTTP server shut down gracefully"),
+            Ok(Err(e)) => {
+                println!("HTTP server encountered an error: {}", e);
+            }
+            Err(join_error) => {
+                println!("HTTP server task panicked: {}", join_error);
+            }
+        }
 
-    Err(anyhow::anyhow!(
-        "Failed to connect to remote server after 10 attempts."
-    ))
+        println!("All components shut down successfully");
+        Ok(())
+    }
 }
 
-/// Attempts to connect to the server and send a health check request.
-async fn attempt_connection(addr: &str, uri: &Uri) -> Result<()> {
-    let stream = TcpStream::connect(addr)
-        .await
-        .context(format!("Failed to connect to {}", addr))?;
+async fn send_credentials_to_remote(credentials: &Credentials, controlling: bool) -> Result<()> {
+    let remote_port = if controlling { 9001 } else { 9000 };
+    let uri = format!("http://127.0.0.1:{}/remoteAuth", remote_port);
+    let body = format!("{}:{}", credentials.ufrag, credentials.pwd);
+
+    let stream = TcpStream::connect(format!("127.0.0.1:{}", remote_port)).await?;
     let io = TokioIo::new(stream);
 
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
         .await
         .context("HTTP/1.1 handshake failed")?;
 
-    tokio::task::spawn(async move {
+    tokio::spawn(async move {
         if let Err(err) = conn.await {
-            eprintln!("Connection failed: {:?}", err);
+            println!("Connection failed: {:?}", err);
         }
     });
 
-    let authority = uri.authority().unwrap().clone();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(hyper::header::HOST, format!("127.0.0.1:{}", remote_port))
+        .body(body)
+        .context("Failed to build credentials request")?;
+
+    sender.send_request(req).await?;
+    Ok(())
+}
+
+async fn send_candidate_to_remote(candidate: &Candidate, controlling: bool) -> Result<()> {
+    let remote_port = if controlling { 9001 } else { 9000 };
+    let uri = format!("http://127.0.0.1:{}/remoteCandidate", remote_port);
+    let body = candidate.marshal();
+
+    let stream = TcpStream::connect(format!("127.0.0.1:{}", remote_port)).await?;
+    let io = TokioIo::new(stream);
+
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+        .await
+        .context("HTTP/1.1 handshake failed")?;
+
+    tokio::spawn(async move {
+        if let Err(err) = conn.await {
+            println!("Connection failed: {:?}", err);
+        }
+    });
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(hyper::header::HOST, format!("127.0.0.1:{}", remote_port))
+        .body(body)
+        .context("Failed to build credentials request")?;
+
+    sender.send_request(req).await?;
+    Ok(())
+}
+
+async fn attempt_health_check(uri: &str) -> Result<()> {
+    // Parse the URI for both connection and request
+    let uri = Uri::from_str(uri).context("Failed to parse health check URI")?;
+    let host = uri.host().context("URI missing host")?;
+    let port = uri.port_u16().context("URI missing port")?;
+    let addr = format!("{}:{}", host, port);
+
+    // Connect to the server
+    let stream = TcpStream::connect(&addr)
+        .await
+        .context("Failed to connect to remote server")?;
+
+    let io = TokioIo::new(stream);
+
+    // Create HTTP client connection
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+        .await
+        .context("HTTP/1.1 handshake failed")?;
+
+    // Spawn connection task
+    tokio::task::spawn(async move {
+        if let Err(err) = conn.await {
+            println!("Connection failed: {:?}", err);
+        }
+    });
+
+    // Build and send request
     let req = Request::builder()
         .uri(uri.path())
-        .header(hyper::header::HOST, authority.as_str())
+        .header(hyper::header::HOST, format!("{}:{}", host, port))
         .body(Empty::<Bytes>::new())
         .context("Failed to build health check request")?;
 
@@ -498,4 +633,45 @@ async fn attempt_connection(addr: &str, uri: &Uri) -> Result<()> {
             res.status()
         ))
     }
+}
+
+fn initialize_ice_agent() -> Result<Agent> {
+    Agent::new(Arc::new(AgentConfig {
+        disconnected_timeout: Some(Duration::from_secs(5)),
+        failed_timeout: Some(Duration::from_secs(5)),
+        ..Default::default()
+    }))
+    .context("Failed to initialize ICE agent")
+}
+
+async fn initialize_udp_socket(controlling: bool) -> Result<UdpSocket> {
+    let port = if controlling { 4000 } else { 4001 };
+    println!("Binding UDP socket on port {}", port);
+    UdpSocket::bind(("0.0.0.0", port))
+        .await
+        .context("Failed to bind UDP socket")
+}
+
+fn determine_http_addr(controlling: bool) -> Result<SocketAddr> {
+    let port = if controlling { 9000 } else { 9001 };
+    Ok(SocketAddr::from(([127, 0, 0, 1], port)))
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Parse command line arguments
+    let cli = Cli::parse();
+
+    // Initialize logging if debug is enabled
+    if cli.debug {
+        let log_level =
+            log::LevelFilter::from_str(&cli.log_level).unwrap_or(log::LevelFilter::Info);
+        env_logger::Builder::new().filter(None, log_level).init();
+    }
+
+    // Create and run application
+    let app = App::new(&cli).await?;
+    app.run().await?;
+
+    Ok(())
 }
