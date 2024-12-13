@@ -16,7 +16,7 @@ stun = { version = "0.2.0", path = "../rtc-stun", package = "rtc-stun" }
 crc = "3.2.1"
 log = "0.4.22"
 rand = "0.8.5"
-serde = { version = "1.0.215", features = ["derive"] }
+serde = { version = "1.0.216", features = ["derive"] }
 url = "2.5.4"
 bytes = "1.9.0"
 anyhow = { version = "1.0", features = ["backtrace"] }

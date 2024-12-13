@@ -14,7 +14,7 @@ shared = { version = "0.2.0", path = "../rtc-shared", package = "rtc-shared", de
 
 bytes = "1.9.0"
 rand = "0.8.5"
-serde = { version = "1.0.215", features = ["derive"] }
+serde = { version = "1.0.216", features = ["derive"] }
 
 [dev-dependencies]
 chrono = "0.4.39"
