@@ -361,7 +361,7 @@ impl RTCPeerConnection {
             // WebRTC utilizes self-signed rather than Public Key Infrastructure (PKI) certificates,
             // so that the expiration check is to ensure that keys are not used indefinitely and
             // additional certificate checks are unnecessary.
-            let kp = KeyPair::generate(&rcgen::PKCS_ECDSA_P256_SHA256)?;
+            let kp = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
             let cert = RTCCertificate::from_key_pair(kp)?;
             configuration.certificates = vec![cert];
         };
@@ -780,7 +780,7 @@ impl RTCPeerConnection {
                     .map_err(|_| Error::ErrCertificateExpired)?;
             }
         } else {
-            let kp = KeyPair::generate(&rcgen::PKCS_ECDSA_P256_SHA256)?;
+            let kp = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
             let cert = RTCCertificate::from_key_pair(kp)?;
             certificates = vec![cert];
         };

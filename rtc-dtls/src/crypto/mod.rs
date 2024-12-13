@@ -35,12 +35,16 @@ impl Certificate {
     ///
     /// See [`rcgen::generate_simple_self_signed`].
     pub fn generate_self_signed(subject_alt_names: impl Into<Vec<String>>) -> Result<Self> {
-        let cert = rcgen::generate_simple_self_signed(subject_alt_names)?;
-        let key_pair = cert.get_key_pair();
+        let certified_key: rcgen::CertifiedKey =
+            rcgen::generate_simple_self_signed(subject_alt_names)?;
+        // Access the key pair from the certificate parameters
+        let key_pair = certified_key.key_pair;
+
+        let private_key = CryptoPrivateKey::from_key_pair(&key_pair)?;
 
         Ok(Certificate {
-            certificate: vec![rustls::Certificate(cert.serialize_der()?)],
-            private_key: CryptoPrivateKey::try_from(key_pair)?,
+            certificate: vec![rustls::Certificate(certified_key.cert.der().to_vec())],
+            private_key,
         })
     }
 
@@ -51,14 +55,18 @@ impl Certificate {
         subject_alt_names: impl Into<Vec<String>>,
         alg: &'static rcgen::SignatureAlgorithm,
     ) -> Result<Self> {
-        let mut params = rcgen::CertificateParams::new(subject_alt_names);
-        params.alg = alg;
-        let cert = rcgen::Certificate::from_params(params)?;
-        let key_pair = cert.get_key_pair();
+        let key_pair = rcgen::KeyPair::generate_for(alg)?;
+
+        let params: rcgen::CertificateParams = rcgen::CertificateParams::new(subject_alt_names)?;
+
+        let cert = params.self_signed(&key_pair)?;
+
+        // Retrieve the key pair from the cert's parameters.
+        let private_key = CryptoPrivateKey::from_key_pair(&key_pair)?;
 
         Ok(Certificate {
-            certificate: vec![rustls::Certificate(cert.serialize_der()?)],
-            private_key: CryptoPrivateKey::try_from(key_pair)?,
+            certificate: vec![rustls::Certificate(cert.der().to_vec())],
+            private_key,
         })
     }
 

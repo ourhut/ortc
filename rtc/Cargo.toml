@@ -34,7 +34,7 @@ bytes = "1.9.0"
 regex = "1.11.1"
 url = "2.5.4"
 rustls = { version = "0.21", features = ["dangerous_configuration"] }
-rcgen = { version = "0.12", features = ["pem", "x509-parser"] }
+rcgen = { version = "0.13", features = ["pem", "x509-parser", "crypto"] }
 ring = "0.17.8"
 sha2 = "0.10.8"
 hex = "0.4.3"
