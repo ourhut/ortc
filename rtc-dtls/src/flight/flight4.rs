@@ -575,7 +575,7 @@ impl Flight for Flight4 {
                             certificate: certificate
                                 .certificate
                                 .iter()
-                                .map(|x| x.0.clone())
+                                .map(|x| x.to_vec())
                                 .collect(),
                         },
                     ))),

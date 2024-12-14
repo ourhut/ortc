@@ -199,7 +199,7 @@ impl Flight for Flight5 {
                     Content::Handshake(Handshake::new(HandshakeMessage::Certificate(
                         HandshakeMessageCertificate {
                             certificate: if let Some(cert) = &certificate {
-                                cert.certificate.iter().map(|x| x.0.clone()).collect()
+                                cert.certificate.iter().map(|x| x.to_vec()).collect()
                             } else {
                                 vec![]
                             },

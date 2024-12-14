@@ -1173,21 +1173,21 @@ async fn test_extended_master_secret() -> Result<()> {
     Ok(())
 }
 
-fn fn_not_expected_chain(_cert: &[Vec<u8>], chain: &[rustls::Certificate]) -> Result<()> {
+fn fn_not_expected_chain(_cert: &[Vec<u8>], chain: &[rustls_pki_types::CertificateDer]) -> Result<()> {
     if !chain.is_empty() {
         return Err(Error::Other(ERR_NOT_EXPECTED_CHAIN.to_owned()));
     }
     Ok(())
 }
 
-fn fn_expected_chain(_cert: &[Vec<u8>], chain: &[rustls::Certificate]) -> Result<()> {
+fn fn_expected_chain(_cert: &[Vec<u8>], chain: &[rustls_pki_types::CertificateDer]) -> Result<()> {
     if chain.is_empty() {
         return Err(Error::Other(ERR_EXPECTED_CHAIN.to_owned()));
     }
     Ok(())
 }
 
-fn fn_wrong_cert(_cert: &[Vec<u8>], _chain: &[rustls::Certificate]) -> Result<()> {
+fn fn_wrong_cert(_cert: &[Vec<u8>], _chain: &[rustls_pki_types::CertificateDer]) -> Result<()> {
     Err(Error::Other(ERR_WRONG_CERT.to_owned()))
 }
 

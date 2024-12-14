@@ -101,7 +101,7 @@ pub fn load_key(path: PathBuf) -> Result<CryptoPrivateKey, Error> {
 }
 
 /// load_certificate Load/read certificate(s) from file
-pub fn load_certificate(path: PathBuf) -> Result<Vec<rustls::Certificate>, Error> {
+pub fn load_certificate(path: PathBuf) -> Result<Vec<rustls_pki_types::CertificateDer>, Error> {
     let f = File::open(path)?;
 
     let mut reader = BufReader::new(f);

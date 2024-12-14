@@ -6,6 +6,11 @@ use crate::signature_hash_algorithm::{
     parse_signature_schemes, SignatureHashAlgorithm, SignatureScheme,
 };
 use log::warn;
+use rustls::client::danger::ServerCertVerifier;
+use rustls::client::WebPkiServerVerifier;
+use rustls::server::danger::ClientCertVerifier;
+use rustls::RootCertStore;
+use rustls_native_certs::load_native_certs;
 use shared::error::*;
 use std::collections::HashMap;
 use std::fmt;
@@ -320,6 +325,14 @@ impl ConfigBuilder {
             }
         }
 
+        let mut root_store = RootCertStore::empty();
+        let result = load_native_certs();
+        for cert in result.certs {
+            root_store.add(cert);
+        }
+
+        let server_cert_verifier = WebPkiServerVerifier::builder(Arc::new(root_store));
+
         Ok(HandshakeConfig {
             local_psk_callback: self.psk.take(),
             local_psk_identity_hint: self.psk_identity_hint.take(),
@@ -334,10 +347,7 @@ impl ConfigBuilder {
             insecure_verification: self.insecure_verification,
             verify_peer_certificate: self.verify_peer_certificate.take(),
             roots_cas: self.roots_cas,
-            server_cert_verifier: Arc::new(rustls::client::WebPkiVerifier::new(
-                rustls::RootCertStore::empty(),
-                None,
-            )),
+            server_cert_verifier: server_cert_verifier.build().unwrap(),
             client_cert_verifier: None,
             retransmit_interval,
             initial_epoch: 0,
@@ -348,8 +358,9 @@ impl ConfigBuilder {
     }
 }
 
-pub(crate) type VerifyPeerCertificateFn =
-    Arc<dyn (Fn(&[Vec<u8>], &[rustls::Certificate]) -> Result<()>) + Send + Sync>;
+pub(crate) type VerifyPeerCertificateFn = Arc<
+    dyn (Fn(&[Vec<u8>], &[rustls_pki_types::CertificateDer<'static>]) -> Result<()>) + Send + Sync,
+>;
 
 #[derive(Clone)]
 pub struct HandshakeConfig {
@@ -367,8 +378,8 @@ pub struct HandshakeConfig {
     pub(crate) insecure_verification: bool,
     pub(crate) verify_peer_certificate: Option<VerifyPeerCertificateFn>,
     pub(crate) roots_cas: rustls::RootCertStore,
-    pub(crate) server_cert_verifier: Arc<dyn rustls::client::ServerCertVerifier>,
-    pub(crate) client_cert_verifier: Option<Arc<dyn rustls::server::ClientCertVerifier>>,
+    pub(crate) server_cert_verifier: Arc<dyn ServerCertVerifier>,
+    pub(crate) client_cert_verifier: Option<Arc<dyn ClientCertVerifier>>,
     pub(crate) retransmit_interval: std::time::Duration,
     pub(crate) initial_epoch: u16,
     pub(crate) maximum_transmission_unit: usize,
@@ -405,6 +416,16 @@ impl fmt::Debug for HandshakeConfig {
 
 impl Default for HandshakeConfig {
     fn default() -> Self {
+        let mut root_store = RootCertStore::empty();
+        let result = load_native_certs();
+        for cert in result.certs {
+            root_store.add(cert);
+        }
+
+        let server_cert_verifier = WebPkiServerVerifier::builder(Arc::new(root_store))
+            .build()
+            .unwrap();
+
         HandshakeConfig {
             local_psk_callback: None,
             local_psk_identity_hint: None,
@@ -420,10 +441,7 @@ impl Default for HandshakeConfig {
             insecure_verification: false,
             verify_peer_certificate: None,
             roots_cas: rustls::RootCertStore::empty(),
-            server_cert_verifier: Arc::new(rustls::client::WebPkiVerifier::new(
-                rustls::RootCertStore::empty(),
-                None,
-            )),
+            server_cert_verifier: server_cert_verifier,
             client_cert_verifier: None,
             retransmit_interval: std::time::Duration::from_secs(0),
             initial_epoch: 0,

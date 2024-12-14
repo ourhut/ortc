@@ -87,9 +87,11 @@ impl RTCCertificate {
             not_after.into()
         };
 
+        let cert_der_static = rustls_pki_types::CertificateDer::from(x509_cert.der().to_owned());
+
         Ok(Self {
             dtls_certificate: dtls::crypto::Certificate {
-                certificate: vec![rustls::Certificate(x509_cert.der().to_vec())],
+                certificate: vec![cert_der_static],
                 private_key,
             },
             expires,

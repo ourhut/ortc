@@ -15,6 +15,8 @@ use log::trace;
 use rcgen::KeyPair;
 use ring::rand::SystemRandom;
 use ring::signature::{EcdsaKeyPair, Ed25519KeyPair};
+use rustls::client::danger::ServerCertVerifier;
+use rustls_pki_types::{DnsName, ServerName, UnixTime};
 
 use crate::curve::named_curve::*;
 use crate::record_layer::record_layer_header::*;
@@ -25,7 +27,7 @@ use shared::error::*;
 #[derive(Clone, PartialEq, Debug)]
 pub struct Certificate {
     /// DER-encoded certificates.
-    pub certificate: Vec<rustls::Certificate>,
+    pub certificate: Vec<rustls_pki_types::CertificateDer<'static>>,
     /// Private key.
     pub private_key: CryptoPrivateKey,
 }
@@ -41,9 +43,10 @@ impl Certificate {
         let key_pair = certified_key.key_pair;
 
         let private_key = CryptoPrivateKey::from_key_pair(&key_pair)?;
+        let raw_cert = certified_key.cert.der();
 
         Ok(Certificate {
-            certificate: vec![rustls::Certificate(certified_key.cert.der().to_vec())],
+            certificate: vec![rustls_pki_types::CertificateDer::from_slice(&raw_cert).into_owned()],
             private_key,
         })
     }
@@ -63,9 +66,10 @@ impl Certificate {
 
         // Retrieve the key pair from the cert's parameters.
         let private_key = CryptoPrivateKey::from_key_pair(&key_pair)?;
+        let cert_der_static = rustls_pki_types::CertificateDer::from(cert.der().to_owned());
 
         Ok(Certificate {
-            certificate: vec![rustls::Certificate(cert.der().to_vec())],
+            certificate: vec![cert_der_static],
             private_key,
         })
     }
@@ -98,7 +102,7 @@ impl Certificate {
                     p.tag()
                 )));
             }
-            rustls_certs.push(rustls::Certificate(p.contents().to_vec()));
+            rustls_certs.push(rustls_pki_types::CertificateDer(p.contents().to_vec()));
         }
 
         Ok(Certificate {
@@ -436,15 +440,17 @@ pub(crate) fn verify_certificate_verify(
     )
 }
 
-pub(crate) fn load_certs(raw_certificates: &[Vec<u8>]) -> Result<Vec<rustls::Certificate>> {
+pub(crate) fn load_certs(
+    raw_certificates: &[Vec<u8>],
+) -> Result<Vec<rustls_pki_types::CertificateDer<'static>>> {
     if raw_certificates.is_empty() {
         return Err(Error::ErrLengthMismatch);
     }
 
     let mut certs = vec![];
     for raw_cert in raw_certificates {
-        let cert = rustls::Certificate(raw_cert.to_vec());
-        certs.push(cert);
+        let cert = rustls_pki_types::CertificateDer::from_slice(raw_cert);
+        certs.push(cert.into_owned());
     }
 
     Ok(certs)
@@ -452,16 +458,15 @@ pub(crate) fn load_certs(raw_certificates: &[Vec<u8>]) -> Result<Vec<rustls::Cer
 
 pub(crate) fn verify_client_cert(
     raw_certificates: &[Vec<u8>],
-    cert_verifier: &Arc<dyn rustls::server::ClientCertVerifier>,
-) -> Result<Vec<rustls::Certificate>> {
+    cert_verifier: &Arc<dyn rustls::server::danger::ClientCertVerifier>,
+) -> Result<Vec<rustls_pki_types::CertificateDer<'static>>> {
     let chains = load_certs(raw_certificates)?;
 
     let (end_entity, intermediates) = chains
         .split_first()
         .ok_or(Error::ErrClientCertificateRequired)?;
 
-    match cert_verifier.verify_client_cert(end_entity, intermediates, std::time::SystemTime::now())
-    {
+    match cert_verifier.verify_client_cert(end_entity, intermediates, UnixTime::now()) {
         Ok(_) => {}
         Err(err) => return Err(Error::Other(err.to_string())),
     };
@@ -471,11 +476,11 @@ pub(crate) fn verify_client_cert(
 
 pub(crate) fn verify_server_cert(
     raw_certificates: &[Vec<u8>],
-    cert_verifier: &Arc<dyn rustls::client::ServerCertVerifier>,
+    cert_verifier: &Arc<dyn ServerCertVerifier>,
     server_name: &str,
-) -> Result<Vec<rustls::Certificate>> {
+) -> Result<Vec<rustls_pki_types::CertificateDer<'static>>> {
     let chains = load_certs(raw_certificates)?;
-    let dns_name = match rustls::server::DnsName::try_from_ascii(server_name.as_ref()) {
+    let dns_name = match DnsName::try_from(server_name) {
         Ok(dns_name) => dns_name,
         Err(err) => return Err(Error::Other(err.to_string())),
     };
@@ -486,10 +491,9 @@ pub(crate) fn verify_server_cert(
     match cert_verifier.verify_server_cert(
         end_entity,
         intermediates,
-        &rustls::ServerName::DnsName(dns_name.to_owned()),
-        &mut [].into_iter(),
-        &[],
-        std::time::SystemTime::now(),
+        &ServerName::DnsName(dns_name.to_owned()),
+        &mut [],
+        UnixTime::now(),
     ) {
         Ok(_) => {}
         Err(err) => return Err(Error::Other(err.to_string())),
